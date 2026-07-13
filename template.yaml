@@ -1,0 +1,422 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Zerodha Portfolio Pipeline
+  S3 -> SNS -> SQS -> Lambda -> RDS MySQL -> SES Email
+
+# ─────────────────────────────────────────────
+# Parameters
+# ─────────────────────────────────────────────
+Parameters:
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: RDS MySQL master password
+
+  SenderEmail:
+    Type: String
+    Description: SES verified sender email
+
+  ReceiverEmail:
+    Type: String
+    Description: Email address to receive notifications
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+# ─────────────────────────────────────────────
+# Globals
+# ─────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 120
+    MemorySize: 256
+    Environment:
+      Variables:
+        DB_NAME: portfolio_db
+        DB_USER: admin
+        DB_PASSWORD: !Ref DBPassword
+        SENDER_EMAIL: !Ref SenderEmail
+        RECEIVER_EMAIL: !Ref ReceiverEmail
+        ENVIRONMENT: !Ref Environment
+
+# ─────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────
+Resources:
+
+  # ═══════════════════════════════════════════
+  # VPC & NETWORKING
+  # ═══════════════════════════════════════════
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-2
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-1
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Free S3 Gateway Endpoint - Lambda reads S3 without going through NAT
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  # ═══════════════════════════════════════════
+  # SECURITY GROUPS
+  # ═══════════════════════════════════════════
+
+  LambdaSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda - outbound only
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  RDSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS MySQL - Lambda only on port 3306
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref LambdaSG
+
+  # ═══════════════════════════════════════════
+  # RDS MYSQL
+  # ═══════════════════════════════════════════
+
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Portfolio DB private subnets
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub ${AWS::StackName}-db
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: '8.0.45'
+      MasterUsername: admin
+      MasterUserPassword: !Ref DBPassword
+      DBName: portfolio_db
+      AllocatedStorage: 20          # integer - not string
+      StorageType: gp2
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSG
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+
+  # ═══════════════════════════════════════════
+  # SQS  (DLQ first, then main queue)
+  # ═══════════════════════════════════════════
+
+  TradeQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-trade-dlq
+      MessageRetentionPeriod: 1209600   # 14 days
+
+  TradeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-trade-queue
+      VisibilityTimeout: 720            # 6 x Lambda timeout (6 x 120)
+      MessageRetentionPeriod: 86400     # 1 day
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TradeQueueDLQ.Arn
+        maxReceiveCount: 3
+
+  SQSPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref TradeQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt TradeQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref TradeTopic
+
+  # ═══════════════════════════════════════════
+  # SNS
+  # ═══════════════════════════════════════════
+
+  TradeTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-trade-topic
+
+  TradeTopicSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: SQSPolicy
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref TradeTopic
+      Endpoint: !GetAtt TradeQueue.Arn
+      RawMessageDelivery: false
+
+  SNSPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref TradeTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: SNS:Publish
+            Resource: !Ref TradeTopic
+            Condition:
+              ArnLike:
+                # Must match BucketName below exactly
+                aws:SourceArn: !Sub arn:aws:s3:::${AWS::StackName}-trades-${AWS::AccountId}
+
+  # ═══════════════════════════════════════════
+  # S3 BUCKET
+  # ═══════════════════════════════════════════
+
+  TradeBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: SNSPolicy          # SNS policy must exist before S3 sets up notifications
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-trades-${AWS::AccountId}
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Topic: !Ref TradeTopic
+            Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/   # Only trigger on uploads/ prefix
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveUploads
+            Status: Enabled
+            Prefix: uploads/
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+
+  # ═══════════════════════════════════════════
+  # LAMBDA LAYER  (pymysql)
+  # ═══════════════════════════════════════════
+
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub ${AWS::StackName}-deps
+      Description: pymysql for RDS connectivity
+      ContentUri: layers/dependencies/
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.12
+
+  # ═══════════════════════════════════════════
+  # LAMBDA FUNCTION
+  # ═══════════════════════════════════════════
+
+  TradeProcessorFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-trade-processor
+      CodeUri: functions/trade_processor/
+      Handler: app.lambda_handler
+      Layers:
+        - !Ref DependenciesLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSG
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt RDSInstance.Endpoint.Address
+          DB_NAME: portfolio_db
+          DB_USER: admin
+          DB_PASSWORD: !Ref DBPassword
+          SENDER_EMAIL: !Ref SenderEmail
+          RECEIVER_EMAIL: !Ref ReceiverEmail
+          ENVIRONMENT: !Ref Environment
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - S3ReadPolicy:
+            BucketName: !Ref TradeBucket
+        - SQSPollerPolicy:
+            QueueName: !GetAtt TradeQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TradeQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+# ─────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────
+Outputs:
+
+  BucketName:
+    Description: "Upload CSV here: aws s3 cp data/sample_trades.csv s3://<bucket>/uploads/"
+    Value: !Ref TradeBucket
+
+  RDSEndpoint:
+    Description: RDS MySQL endpoint
+    Value: !GetAtt RDSInstance.Endpoint.Address
+
+  LambdaName:
+    Description: Lambda function name
+    Value: !Ref TradeProcessorFn
+
+  SQSDLQUrl:
+    Description: Dead Letter Queue - check here if pipeline fails
+    Value: !Ref TradeQueueDLQ
+
+  TestUploadCommand:
+    Description: Run this to test the full pipeline
+    Value: !Sub >
+      aws s3 cp data/sample_trades.csv
+      s3://${AWS::StackName}-trades-${AWS::AccountId}/uploads/sample_trades.csv
+      --region ap-south-1

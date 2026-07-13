@@ -1,0 +1,15 @@
+# Portfolio Reference Document
+portfolio_zerodha_pipeline.md
+
+# AWS SAM Build Directory
+.aws-sam/
+
+# Python Caches & Virtual Environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+.pytest_cache/

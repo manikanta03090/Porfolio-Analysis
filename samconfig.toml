@@ -1,0 +1,16 @@
+version = 0.1
+
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name        = "zerodha-portfolio-pipeline"
+s3_prefix         = "zerodha-pipeline"
+region            = "ap-south-1"
+confirm_changeset = true
+capabilities      = "CAPABILITY_IAM"
+resolve_s3        = true
+on_failure        = "DELETE"
+
+# ── EDIT THESE BEFORE DEPLOYING ──────────────────────────────────────────────
+parameter_overrides = "Environment=dev DBPassword=YourSecurePass123 SenderEmail=gmanikanta.0528@gmail.com ReceiverEmail=manikantag250@gmail.com"
+# ─────────────────────────────────────────────────────────────────────────────

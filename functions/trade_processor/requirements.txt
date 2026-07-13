@@ -1,0 +1,2 @@
+# Dependencies are in the Lambda Layer (layers/dependencies/)
+# boto3 is included in the Lambda runtime - no need to package it
